@@ -1,0 +1,1331 @@
+import datetime
+import logging
+from io import BytesIO
+
+from openpyxl import Workbook, load_workbook
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# Enable logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# --- Database & State Trackers (In-Memory) ---
+user_balances = {}
+user_states = {}
+registered_users = set()
+
+admin_states = {}
+admin_temp_data = {}
+admin_reply_targets = {}
+offline_pending_users = set()
+
+# Add Money flow trackers
+user_addmoney_data = {}          # user_id -> {"method": ..., "amount": ...}
+pending_addmoney_requests = {}   # req_id -> {"user_id","amount","method","trxid","status"}
+addmoney_request_counter = 0
+
+# Buy Product flow trackers
+user_buy_data = {}               # user_id -> {"cat": ..., "srv": ...}
+
+# Support ticket trackers
+support_assigned_admin = {}
+support_broadcast_msgs = {}
+
+# VPN manual (out-of-stock) order trackers
+vpn_order_counter = 0
+pending_vpn_orders = {}     # req_id -> {"user_id","cat","srv","amount","total_price","status"}
+vpn_delivery_context = {}   # admin_id -> req_id (which order the admin is currently delivering)
+
+# Sales tracking (resets daily via scheduled job at 00:00)
+daily_sales = {}  # short_cat -> {"amount": int, "total_price": float, "services": {srv_name: {"amount": int, "total_price": float}}}
+
+# Admin Credentials
+ADMINS = {
+    7224430384: "Rifat",
+    7854220310: "Nirob",
+}
+
+# Group used for Add Money, out-of-stock manual orders, and the sales report.
+ADMIN_GROUP_ID = -1004386316789
+
+# --- Force-Join Gate ---
+CHANNEL_USERNAME = "@Rtx_V999_Channel"
+CHANNEL_LINK = "https://t.me/Rtx_V999_Channel"
+
+JOIN_PROMPT_TEXT = (
+    "📢 **প্রথমে আমাদের চ্যানেলে জয়েন করুন!**\n\n"
+    "এই বটটি ব্যবহার করতে হলে আপনাকে অবশ্যই আমাদের চ্যানেলে জয়েন করতে হবে।\n\n"
+    "1️⃣ নিচের **Join Channel** বাটনে ট্যাপ করুন\n"
+    "2️⃣ এরপর ভেরিফাই করতে **✅ I've Joined** বাটনে ট্যাপ করুন\n\n"
+    "⚠️ পরে চ্যানেল ছেড়ে দিলে, পরবর্তীতে বট ব্যবহার করার সময় আবার জয়েন করতে বলা হবে।"
+)
+
+# --- Dynamic Bot Data ---
+bot_status = True  # True = Online, False = Offline
+
+products = {
+    "🌐 Proxy": {
+        "services": {}
+    },
+    "🛡️ VPN": {
+        "services": {}
+    },
+    "📧 Trusted Mail": {
+        "services": {}
+    }
+}
+
+payment_numbers = {
+    "bKash": "01XXXXXXXXX",
+    "Nagad": "01XXXXXXXXX",
+    "Rocket": "01XXXXXXXXX",
+}
+
+# --- Reply Keyboards ---
+def main_menu_keyboard(user_id):
+    keyboard = [
+        [KeyboardButton("🛒 Buy Package"), KeyboardButton("➕ Add Money")],
+        [KeyboardButton("👥 Refer"), KeyboardButton("💰 Balance")],
+        [KeyboardButton("🛠 Support")],
+    ]
+    if user_id in ADMINS:
+        keyboard.append([KeyboardButton("👑 Admin Panel")])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def admin_menu_keyboard():
+    status_icon = "🟢 Status: Online" if bot_status else "🔴 Status: Offline"
+    keyboard = [
+        [KeyboardButton("➕ Add Service"), KeyboardButton("🗑️ Delete Service")],
+        [KeyboardButton("📢 Broadcast"), KeyboardButton("💲 Change Price")],
+        [KeyboardButton("📱 Payment No."), KeyboardButton("📦 Add Stock")],
+        [KeyboardButton("📊 Check Stock"), KeyboardButton(status_icon)],
+        [KeyboardButton("📈 Sales Report")],
+        [KeyboardButton("⬅️ Main Menu")],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def back_to_menu_keyboard():
+    return ReplyKeyboardMarkup([[KeyboardButton("⬅️ Main Menu")]], resize_keyboard=True)
+
+# --- Inline Keyboards ---
+def buy_product_inline():
+    keyboard = [
+        [InlineKeyboardButton("🛡️ VPN", callback_data="buy_cat_VPN"), InlineKeyboardButton("🌐 Proxy", callback_data="buy_cat_Proxy")],
+        [InlineKeyboardButton("📧 Trusted Mail", callback_data="buy_cat_Trusted Mail")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_menu")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def add_money_inline():
+    keyboard = [
+        [InlineKeyboardButton("Bkash", callback_data="pay_bKash"), InlineKeyboardButton("Nagad", callback_data="pay_Nagad")],
+        [InlineKeyboardButton("Rocket", callback_data="pay_Rocket")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_menu")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def join_gate_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📢 Join Channel", url=CHANNEL_LINK)],
+        [InlineKeyboardButton("✅ I've Joined", callback_data="verify_join")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def admin_category_inline(action_prefix):
+    keyboard = [
+        [InlineKeyboardButton("🛡️ VPN", callback_data=f"{action_prefix}_VPN"), InlineKeyboardButton("🌐 Proxy", callback_data=f"{action_prefix}_Proxy")],
+        [InlineKeyboardButton("📧 Trusted Mail", callback_data=f"{action_prefix}_Trusted Mail")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_menu")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# --- Helpers ---
+def category_short_name(real_cat):
+    if "VPN" in real_cat:
+        return "VPN"
+    if "Proxy" in real_cat:
+        return "Proxy"
+    return "Trusted Mail"
+
+def build_delivery_text(cat, srv, date_str, amount, total_price, body_text):
+    lines = [
+        cat,
+        srv,
+        f"📅 তারিখ: {date_str}",
+        f"🔢 পরিমাণ: {amount}",
+        f"💰 মোট মূল্য: {total_price:.2f} টাকা",
+        "",
+        body_text,
+    ]
+    return "\n".join(lines)
+
+def format_cell_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return str(value)
+    return str(value).strip()
+
+def escape_markdown_v1(text):
+    if text is None:
+        return ""
+    text = str(text)
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+async def send_group_message(bot, chat_id, text, reply_markup=None):
+    try:
+        return await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Markdown send to {chat_id} failed, retrying as plain text: {e}")
+        try:
+            return await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+        except Exception as e2:
+            logger.error(f"Plain-text send to {chat_id} also failed: {e2}")
+            return None
+
+async def check_membership(bot, user_id):
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception as e:
+        logger.error(f"Membership check failed for user {user_id}: {e}")
+        return False
+
+# --- Sales Report Helpers ---
+def record_sale(cat, srv, amount, total_price):
+    short_cat = category_short_name(cat)
+    cat_data = daily_sales.setdefault(short_cat, {"amount": 0, "total_price": 0.0, "services": {}})
+    cat_data["amount"] += amount
+    cat_data["total_price"] += total_price
+    srv_data = cat_data["services"].setdefault(srv, {"amount": 0, "total_price": 0.0})
+    srv_data["amount"] += amount
+    srv_data["total_price"] += total_price
+
+def build_sales_report_text(title="📊 **Sales Report**"):
+    lines = [title, ""]
+    order = ["VPN", "Proxy", "Trusted Mail"]
+    grand_total_pieces = 0
+    grand_total_price = 0.0
+    any_sales = False
+
+    for short_cat in order:
+        cat_data = daily_sales.get(short_cat, {"amount": 0, "total_price": 0.0, "services": {}})
+        if cat_data["amount"] > 0:
+            any_sales = True
+        grand_total_pieces += cat_data["amount"]
+        grand_total_price += cat_data["total_price"]
+
+        lines.append(f"**{short_cat}**")
+        if cat_data["services"]:
+            idx = 1
+            for srv_name, sdata in cat_data["services"].items():
+                lines.append(f"{idx}. {srv_name} - Total sell: {sdata['amount']} - Total Price: {sdata['total_price']:.2f} Tk")
+                idx += 1
+        else:
+            lines.append("কোনো সেল হয়নি")
+        lines.append("")
+
+    lines.append(f"🧾 **সর্বমোট বিক্রি:** {grand_total_pieces} পিস")
+    lines.append(f"💰 **সর্বমোট আয়:** {grand_total_price:.2f} টাকা")
+
+    if not any_sales:
+        lines.insert(2, "আজ এখনো কোনো সেল হয়নি।\n")
+
+    return "\n".join(lines).strip()
+
+def reset_daily_sales():
+    daily_sales.clear()
+
+async def send_midnight_sales_report(context: ContextTypes.DEFAULT_TYPE):
+    date_str = datetime.datetime.now().strftime("%d-%m-%Y")
+    report_text = build_sales_report_text(title=f"📊 **Sales Report ({date_str})**")
+    await send_group_message(context.bot, ADMIN_GROUP_ID, report_text)
+    reset_daily_sales()
+
+# --- Handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+
+    if not bot_status and user_id not in ADMINS:
+        await update.message.reply_text("⛔ বটটি বর্তমানে রক্ষণাবেক্ষণের কারণে বন্ধ আছে। একটু পরে আবার চেষ্টা করুন।")
+        return
+
+    if user_id not in ADMINS:
+        joined = await check_membership(context.bot, user_id)
+        if not joined:
+            await update.message.reply_text(JOIN_PROMPT_TEXT, reply_markup=join_gate_keyboard(), parse_mode="Markdown")
+            return
+
+    registered_users.add(user_id)
+    if user_id not in user_balances:
+        user_balances[user_id] = 0.0
+    user_states[user_id] = None
+
+    welcome_text = (
+        f"আসসালামু আলাইকুম **{user.first_name}**! 🙏\n\n"
+        "আমাদের বটে স্বাগতম। নিচে থেকে একটি অপশন বেছে নিন:"
+    )
+    await update.message.reply_text(
+        welcome_text, reply_markup=main_menu_keyboard(user_id), parse_mode="Markdown"
+    )
+
+async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global bot_status, addmoney_request_counter, vpn_order_counter
+    text = update.message.text
+    user = update.effective_user
+    user_id = user.id
+
+    if not bot_status and user_id not in ADMINS:
+        await update.message.reply_text("⛔ বটটি বর্তমানে রক্ষণাবেক্ষণের কারণে বন্ধ আছে। একটু পরে আবার চেষ্টা করুন।")
+        return
+
+    if user_id not in ADMINS:
+        joined = await check_membership(context.bot, user_id)
+        if not joined:
+            await update.message.reply_text(JOIN_PROMPT_TEXT, reply_markup=join_gate_keyboard(), parse_mode="Markdown")
+            return
+
+    if user_id not in user_balances:
+        user_balances[user_id] = 0.0
+    registered_users.add(user_id)
+
+    if text in ["⬅️ Main Menu", "/start", "⬅️ Back to Menu"]:
+        user_states[user_id] = None
+        user_buy_data.pop(user_id, None)
+        user_addmoney_data.pop(user_id, None)
+        if user_id in ADMINS:
+            admin_states.pop(user_id, None)
+            admin_temp_data.pop(user_id, None)
+            vpn_delivery_context.pop(user_id, None)
+        await update.message.reply_text("মেইন মেনু:", reply_markup=main_menu_keyboard(user_id))
+        return
+
+    if user_id in ADMINS:
+        state = admin_states.get(user_id)
+
+        if state == "waiting_admin_reply":
+            target_user_id = admin_reply_targets.get(user_id)
+            if target_user_id:
+                user_reply_kbd = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("💬 Reply", callback_data="user_support_reply")]]
+                )
+                sent = await send_group_message(
+                    context.bot,
+                    target_user_id,
+                    f"👨‍💻 **অ্যাডমিন:**\n\n{escape_markdown_v1(text)}",
+                    reply_markup=user_reply_kbd,
+                )
+                if sent is None:
+                    await update.message.reply_text("❌ ইউজারকে মেসেজ পাঠাতে ব্যর্থ হয়েছে।")
+                else:
+                    await update.message.reply_text("✅ রিপ্লাই সফলভাবে পাঠানো হয়েছে!")
+            admin_states.pop(user_id, None)
+            return
+
+        elif state == "waiting_vpn_delivery":
+            req_id = vpn_delivery_context.get(user_id)
+            req = pending_vpn_orders.get(req_id) if req_id else None
+
+            if not req or req["status"] != "awaiting_delivery":
+                await update.message.reply_text("❌ এই রিকোয়েস্টটি আর সক্রিয় নেই।", reply_markup=admin_menu_keyboard())
+                admin_states.pop(user_id, None)
+                vpn_delivery_context.pop(user_id, None)
+                return
+
+            target_user_id = req["user_id"]
+            cat = req["cat"]
+            srv = req["srv"]
+            amount = req["amount"]
+            total_price = req["total_price"]
+            date_str = datetime.datetime.now().strftime("%d-%m-%Y")
+
+            delivery_text = build_delivery_text(cat, srv, date_str, amount, total_price, text)
+
+            sent = await send_group_message(context.bot, target_user_id, delivery_text)
+            if sent is None:
+                await update.message.reply_text("❌ ইউজারকে ডেলিভারি মেসেজ পাঠাতে ব্যর্থ হয়েছে। আবার চেষ্টা করুন।")
+            else:
+                req["status"] = "delivered"
+                record_sale(cat, srv, amount, total_price)
+                await update.message.reply_text(
+                    f"✅ রিকোয়েস্ট #{req_id} সফলভাবে ডেলিভার করা হয়েছে!", reply_markup=admin_menu_keyboard()
+                )
+                admin_states.pop(user_id, None)
+                vpn_delivery_context.pop(user_id, None)
+            return
+
+        elif state == "admin_broadcast":
+            await update.message.reply_text("⏳ সকল ইউজারের কাছে মেসেজ পাঠানো হচ্ছে...")
+            success = 0
+            for uid in registered_users:
+                try:
+                    await context.bot.send_message(chat_id=uid, text=text)
+                    success += 1
+                except:
+                    pass
+            await update.message.reply_text(f"✅ ব্রডকাস্ট সম্পন্ন হয়েছে! {success} জন ইউজারের কাছে পাঠানো হয়েছে।", reply_markup=admin_menu_keyboard())
+            admin_states.pop(user_id, None)
+            return
+
+        elif state == "admin_add_service_name":
+            admin_temp_data[user_id]["service_name"] = text
+            admin_states[user_id] = "admin_add_service_price"
+            await update.message.reply_text("💰 এখন এই সার্ভিসের দাম পাঠান:")
+            return
+
+        elif state == "admin_add_service_price":
+            try:
+                price = float(text)
+                data = admin_temp_data.get(user_id)
+                category = data["category"]
+                srv_name = data["service_name"]
+
+                products[category]["services"][srv_name] = {
+                    "price": price,
+                    "stock": []
+                }
+                await update.message.reply_text(f"✅ **{category}** এর অধীনে **{srv_name}** সার্ভিসটি {price} টাকা দামে সফলভাবে যোগ করা হয়েছে!", reply_markup=admin_menu_keyboard(), parse_mode="Markdown")
+            except ValueError:
+                await update.message.reply_text("❌ ভুল দাম! সঠিক একটি সংখ্যা পাঠান।")
+            admin_states.pop(user_id, None)
+            admin_temp_data.pop(user_id, None)
+            return
+
+        elif state == "admin_change_price_input":
+            target_data = admin_temp_data.get(user_id)
+            try:
+                new_price = float(text)
+                cat = target_data["cat"]
+                srv = target_data["srv"]
+                products[cat]["services"][srv]["price"] = new_price
+                await update.message.reply_text(f"✅ **{srv}** এর দাম {new_price} টাকায় পরিবর্তন করা হয়েছে।", reply_markup=admin_menu_keyboard(), parse_mode="Markdown")
+            except ValueError:
+                await update.message.reply_text("❌ ভুল দাম। একটি সংখ্যা দিতে হবে।")
+            admin_states.pop(user_id, None)
+            admin_temp_data.pop(user_id, None)
+            return
+
+        elif state == "admin_change_number_input":
+            target_method = admin_temp_data.get(user_id)
+            payment_numbers[target_method] = text
+            await update.message.reply_text(f"✅ {target_method} নাম্বার পরিবর্তন করে করা হয়েছে: `{text}`", reply_markup=admin_menu_keyboard(), parse_mode="Markdown")
+            admin_states.pop(user_id, None)
+            admin_temp_data.pop(user_id, None)
+            return
+
+        elif state == "admin_add_stock_file":
+            await update.message.reply_text(
+                "📎 অনুগ্রহ করে **.xlsx** স্টক ফাইলটি আপলোড করুন (টেক্সট নয়)। পেপারক্লিপ/অ্যাটাচ বাটন ব্যবহার করুন।",
+                parse_mode="Markdown",
+            )
+            return
+
+    if user_states.get(user_id) == "waiting_buy_amount":
+        buy_data = user_buy_data.get(user_id)
+        if not buy_data:
+            user_states[user_id] = None
+            await update.message.reply_text("❌ কিছু একটা সমস্যা হয়েছে। অনুগ্রহ করে 🛒 Buy Package থেকে আবার শুরু করুন。", reply_markup=main_menu_keyboard(user_id))
+            return
+
+        cat = buy_data["cat"]
+        srv = buy_data["srv"]
+        srv_data = products.get(cat, {}).get("services", {}).get(srv)
+
+        if not srv_data:
+            user_states[user_id] = None
+            user_buy_data.pop(user_id, None)
+            await update.message.reply_text("❌ এই সার্ভিসটি এখন আর উপলব্ধ নেই।", reply_markup=main_menu_keyboard(user_id))
+            return
+
+        try:
+            amount = int(text.strip())
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ ভুল পরিমাণ! সঠিক একটি পূর্ণসংখ্যা পাঠান (যেমন: 1, 2, 3)।")
+            return
+
+        stock = srv_data["stock"]
+        price = srv_data["price"]
+        total_price = price * amount
+        balance = user_balances.get(user_id, 0.0)
+        short_cat = category_short_name(cat)
+
+        # VPN Out-of-Stock Manual Order Feature
+        if short_cat == "VPN" and amount > len(stock):
+            if balance < total_price:
+                user_states[user_id] = None
+                user_buy_data.pop(user_id, None)
+                await update.message.reply_text(
+                    f"❌ **ব্যালেন্স অপর্যাপ্ত!**\n\n"
+                    f"প্রয়োজন: {total_price:.2f} টাকা\n"
+                    f"আপনার ব্যালেন্স: {balance:.2f} টাকা\n\n"
+                    f"অনুগ্রহ করে ➕ Add Money ব্যবহার করে প্রথমে টাকা যোগ করুন।",
+                    reply_markup=main_menu_keyboard(user_id),
+                    parse_mode="Markdown",
+                )
+                return
+
+            user_states[user_id] = None
+            user_buy_data.pop(user_id, None)
+
+            vpn_order_counter += 1
+            req_id = vpn_order_counter
+            pending_vpn_orders[req_id] = {
+                "user_id": user_id,
+                "cat": cat,
+                "srv": srv,
+                "amount": amount,
+                "total_price": total_price,
+                "status": "awaiting_admin",
+            }
+
+            await update.message.reply_text(
+                f"🔄 স্টক পর্যাপ্ত না থাকায় আপনার ম্যানুয়াল অর্ডারের রিকোয়েস্ট অ্যাডমিনের কাছে পাঠানো হয়েছে。\n"
+                f"অর্ডারের পরিমাণ: **{amount} টি**\n"
+                f"মূল্য: **{total_price:.2f} টাকা**\n\n"
+                f"অ্যাডমিন স্টক কনফার্ম করলে আপনাকে ডেলিভারি দেওয়া হবে।",
+                reply_markup=main_menu_keyboard(user_id),
+                parse_mode="Markdown",
+            )
+
+            admin_markup = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Accept & Deliver", callback_data=f"vpn_accept_{req_id}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"vpn_reject_{req_id}"),
+                ]
+            ])
+            await send_group_message(
+                context.bot,
+                ADMIN_GROUP_ID,
+                (
+                    "🚨 **নতুন VPN আউট-অফ-স্টক অর্ডার রিকোয়েস্ট!**\n\n"
+                    f"🆔 অর্ডার আইডি: `#{req_id}`\n"
+                    f"👤 ইউজার: {escape_markdown_v1(user.full_name)} (`{user_id}`)\n"
+                    f"📦 ক্যাটাগরি: {cat}\n"
+                    f"🛠 সার্ভিস: {srv}\n"
+                    f"🔢 পরিমাণ: {amount}\n"
+                    f"💰 মোট মূল্য: {total_price:.2f} টাকা"
+                ),
+                reply_markup=admin_markup,
+            )
+            return
+
+        if amount > len(stock):
+            user_states[user_id] = None
+            user_buy_data.pop(user_id, None)
+            await update.message.reply_text(
+                f"❌ **দুঃখিত, পর্যাপ্ত স্টক নেই!**\n\n"
+                f"বর্তমান স্টক: **{len(stock)} টি**\n"
+                f"আপনি চেয়েছেন: **{amount} টি**",
+                reply_markup=main_menu_keyboard(user_id),
+                parse_mode="Markdown",
+            )
+            return
+
+        if balance < total_price:
+            user_states[user_id] = None
+            user_buy_data.pop(user_id, None)
+            await update.message.reply_text(
+                f"❌ **ব্যালেন্স অপর্যাপ্ত!**\n\n"
+                f"প্রয়োজন: {total_price:.2f} টাকা\n"
+                f"আপনার ব্যালেন্স: {balance:.2f} টাকা",
+                reply_markup=main_menu_keyboard(user_id),
+                parse_mode="Markdown",
+            )
+            return
+
+        user_states[user_id] = None
+        user_buy_data.pop(user_id, None)
+
+        purchased_items = stock[:amount]
+        srv_data["stock"] = stock[amount:]
+        user_balances[user_id] = balance - total_price
+
+        date_str = datetime.datetime.now().strftime("%d-%m-%Y")
+
+        if short_cat == "VPN":
+            body_parts = []
+            for item in purchased_items:
+                parts = item.split(",", 1)
+                email = parts[0].strip() if len(parts) > 0 else ""
+                password = parts[1].strip() if len(parts) > 1 else ""
+                body_parts.append(f"📧 ইমেইল: `{email}`\n🔑 পাসওয়ার্ড: `{password}`")
+            body_text = "\n\n".join(body_parts)
+            full_text = build_delivery_text(cat, srv, date_str, amount, total_price, body_text)
+            await update.message.reply_text(full_text, reply_markup=main_menu_keyboard(user_id), parse_mode="Markdown")
+            record_sale(cat, srv, amount, total_price)
+
+        elif short_cat == "Proxy":
+            body_parts = []
+            for item in purchased_items:
+                parts = [p.strip() for p in item.split(",")]
+                server = parts[0] if len(parts) > 0 else ""
+                port = parts[1] if len(parts) > 1 else ""
+                proxy_user = parts[2] if len(parts) > 2 else ""
+                proxy_pass = parts[3] if len(parts) > 3 else ""
+                body_parts.append(
+                    f"🖥️ সার্ভার: `{server}`\n🔌 পোর্ট: `{port}`\n👤 ইউজার: `{proxy_user}`\n🔑 পাসওয়ার্ড: `{proxy_pass}`"
+                )
+            body_text = "\n\n".join(body_parts)
+            full_text = build_delivery_text(cat, srv, date_str, amount, total_price, body_text)
+            await update.message.reply_text(full_text, reply_markup=main_menu_keyboard(user_id), parse_mode="Markdown")
+            record_sale(cat, srv, amount, total_price)
+
+        else:
+            caption_text = build_delivery_text(cat, srv, date_str, amount, total_price, "📎 আপনার ইমেইলগুলো নিচে সংযুক্ত করা হলো।")
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Trusted Mail"
+            for item in purchased_items:
+                ws.append([item.strip()])
+            bio = BytesIO()
+            wb.save(bio)
+            bio.seek(0)
+            bio.name = f"{srv}_{date_str}.xlsx"
+
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=bio,
+                filename=bio.name,
+                caption=caption_text,
+                parse_mode="Markdown",
+            )
+            await update.message.reply_text("✅ ক্রয় সম্পন্ন হয়েছে!", reply_markup=main_menu_keyboard(user_id))
+            record_sale(cat, srv, amount, total_price)
+        return
+
+    if user_states.get(user_id) == "waiting_addmoney_amount":
+        try:
+            amount = float(text)
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ ভুল পরিমাণ! সঠিক একটি সংখ্যা পাঠান (যেমন: 100).")
+            return
+
+        user_addmoney_data.setdefault(user_id, {})["amount"] = amount
+        user_states[user_id] = "waiting_addmoney_trxid"
+        await update.message.reply_text("🧾 এখন **ট্রানজেকশন আইডি (TrxID)** পাঠান:", parse_mode="Markdown")
+        return
+
+    elif user_states.get(user_id) == "waiting_addmoney_trxid":
+        data = user_addmoney_data.get(user_id, {})
+        method = data.get("method", "Unknown")
+        amount = data.get("amount", 0)
+        trxid = text.strip()
+
+        addmoney_request_counter += 1
+        req_id = addmoney_request_counter
+        pending_addmoney_requests[req_id] = {
+            "user_id": user_id,
+            "amount": amount,
+            "method": method,
+            "trxid": trxid,
+            "status": "pending",
+        }
+
+        user_states[user_id] = None
+        user_addmoney_data.pop(user_id, None)
+
+        await update.message.reply_text(
+            "✅ আপনার Add Money রিকোয়েস্ট জমা দেওয়া হয়েছে! অনুগ্রহ করে অ্যাডমিনের কনফার্মেশনের জন্য অপেক্ষা করুন.",
+            reply_markup=main_menu_keyboard(user_id),
+        )
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Confirm", callback_data=f"confirm_addmoney_{req_id}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_addmoney_{req_id}"),
+            ]
+        ])
+        await send_group_message(
+            context.bot,
+            ADMIN_GROUP_ID,
+            (
+                "🆕 **নতুন Add Money রিকোয়েস্ট**\n\n"
+                f"👤 ইউজার: {escape_markdown_v1(user.full_name)} (`{user_id}`)\n"
+                f"💰 পরিমাণ: {amount}\n"
+                f"💳 মাধ্যম: {method}\n"
+                f"🧾 ট্রানজেকশন আইডি: `{escape_markdown_v1(trxid)}`"
+            ),
+            reply_markup=keyboard,
+        )
+        return
+
+    if user_states.get(user_id) == "waiting_support":
+        user_states[user_id] = None
+        assigned_admin_id = support_assigned_admin.get(user_id)
+
+        if assigned_admin_id and assigned_admin_id in ADMINS:
+            await update.message.reply_text(
+                "✅ আপনার মেসেজ অ্যাডমিনের কাছে পাঠানো হয়েছে। শীঘ্রই আপনাকে রিপ্লাই দেওয়া হবে!",
+                reply_markup=main_menu_keyboard(user_id),
+            )
+            admin_kbd = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("💬 Reply", callback_data=f"support_reply_{user_id}")]]
+            )
+            await send_group_message(
+                context.bot,
+                assigned_admin_id,
+                (
+                    f"📩 **ইউজারের কাছ থেকে নতুন মেসেজ!**\n\n"
+                    f"👤 ইউজার: {escape_markdown_v1(user.full_name)} (`{user_id}`)\n"
+                    f"💬 মেসেজ:\n{escape_markdown_v1(text)}"
+                ),
+                reply_markup=admin_kbd,
+            )
+            return
+
+        await update.message.reply_text(
+            "✅ আপনার মেসেজ আমাদের সাপোর্ট অ্যাডমিনদের কাছে পাঠানো হয়েছে। শীঘ্রই আপনাকে রিপ্লাই দেওয়া হবে!",
+            reply_markup=main_menu_keyboard(user_id),
+        )
+
+        sent_msgs = []
+        for admin_id in ADMINS.keys():
+            admin_kbd = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("💬 Reply", callback_data=f"support_reply_{user_id}")]]
+            )
+            sent = await send_group_message(
+                context.bot,
+                admin_id,
+                (
+                    f"📩 **নতুন সাপোর্ট মেসেজ!**\n\n"
+                    f"👤 ইউজার: {escape_markdown_v1(user.full_name)} (`{user_id}`)\n"
+                    f"💬 মেসেজ:\n{escape_markdown_v1(text)}"
+                ),
+                reply_markup=admin_kbd,
+            )
+            if sent is not None:
+                sent_msgs.append((admin_id, sent.message_id))
+
+        support_broadcast_msgs[user_id] = sent_msgs
+        return
+
+    if text == "🛒 Buy Package":
+        await update.message.reply_text(
+            "📦 **ক্যাটাগরি বেছে নিন:**",
+            reply_markup=buy_product_inline(),
+            parse_mode="Markdown",
+        )
+
+    elif text == "➕ Add Money":
+        if not bot_status:
+            offline_pending_users.add(user_id)
+            await update.message.reply_text("🔴 অ্যাডমিন বর্তমানে অফলাইনে আছেন। অ্যাডমিন অনলাইনে এলে আপনাকে জানানো হবে।", reply_markup=main_menu_keyboard(user_id))
+        else:
+            await update.message.reply_text(
+                "💳 **মাধ্যম বেছে নিন:**",
+                reply_markup=add_money_inline(),
+                parse_mode="Markdown",
+            )
+
+    elif text == "👥 Refer":
+        bot_username = context.bot.username
+        referral_link = f"https://t.me/{bot_username}?start={user_id}"
+        await update.message.reply_text(
+            "👥 **রেফার করে আয় করুন**\n\n"
+            "আপনার বন্ধুদের সাথে আপনার রেফারেল লিংক শেয়ার করুন। কেউ প্রথমবার আপনার লিংক দিয়ে বট চালু করলে, আপনি **২ টাকা** ব্যালেন্স বোনাস পাবেন!\n\n"
+            f"🔗 আপনার লিংক:\n`{referral_link}`",
+            reply_markup=main_menu_keyboard(user_id),
+            parse_mode="Markdown",
+        )
+
+    elif text == "💰 Balance":
+        balance = user_balances.get(user_id, 0.0)
+        await update.message.reply_text(
+            f"💰 **আপনার অ্যাকাউন্ট ব্যালেন্স**\n\nবর্তমান ব্যালেন্স: **{balance:.2f} টাকা**",
+            reply_markup=main_menu_keyboard(user_id),
+            parse_mode="Markdown",
+        )
+
+    elif text == "🛠 Support":
+        user_states[user_id] = "waiting_support"
+        await update.message.reply_text(
+            "🛠 **কাস্টমার সাপোর্ট**\n\n"
+            "এখানে আপনার মেসেজ পাঠান, আমাদের অ্যাডমিনরা শীঘ্রই আপনাকে রিপ্লাই দেবেন:",
+            reply_markup=back_to_menu_keyboard(),
+            parse_mode="Markdown",
+        )
+
+    elif user_id in ADMINS:
+        if text == "👑 Admin Panel":
+            admin_states.pop(user_id, None)
+            await update.message.reply_text(
+                f"👑 **অ্যাডমিন প্যানেল**\nস্বাগতম, {ADMINS[user_id]}!\nমোট ইউজার: {len(registered_users)}",
+                reply_markup=admin_menu_keyboard(),
+                parse_mode="Markdown",
+            )
+
+        elif text == "➕ Add Service":
+            await update.message.reply_text("➕ সার্ভিস যোগ করতে ক্যাটাগরি বেছে নিন:", reply_markup=admin_category_inline("add_srv_cat"))
+
+        elif text == "🗑️ Delete Service":
+            await update.message.reply_text("🗑️ সার্ভিস ডিলিট করতে ক্যাটাগরি বেছে নিন:", reply_markup=admin_category_inline("del_srv_cat"))
+
+        elif text == "📢 Broadcast":
+            admin_states[user_id] = "admin_broadcast"
+            await update.message.reply_text("📢 আপনার মেসেজ পাঠান:")
+
+        elif text == "💲 Change Price":
+            await update.message.reply_text("💲 দাম পরিবর্তন করতে ক্যাটাগরি বেছে নিন:", reply_markup=admin_category_inline("price_srv_cat"))
+
+        elif text == "📱 Payment No.":
+            keyboard = [
+                [InlineKeyboardButton("Bkash", callback_data="pay_mod_bKash"), InlineKeyboardButton("Nagad", callback_data="pay_mod_Nagad")],
+                [InlineKeyboardButton("Rocket", callback_data="pay_mod_Rocket")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_menu")],
+            ]
+            await update.message.reply_text("📱 নাম্বার পরিবর্তন করতে পেমেন্ট মাধ্যম বেছে নিন:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+        elif text == "📦 Add Stock":
+            await update.message.reply_text("📦 স্টক যোগ করতে ক্যাটাগরি বেছে নিন:", reply_markup=admin_category_inline("add_stock_cat"))
+
+        elif text == "📊 Check Stock":
+            await update.message.reply_text("📊 স্টক চেক করতে ক্যাটাগরি বেছে নিন:", reply_markup=admin_category_inline("check_stock_cat"))
+
+        elif text == "📈 Sales Report":
+            date_str = datetime.datetime.now().strftime("%d-%m-%Y")
+            report_text = build_sales_report_text(title=f"📊 **Sales Report ({date_str})**")
+            await update.message.reply_text(report_text, reply_markup=admin_menu_keyboard(), parse_mode="Markdown")
+
+        elif text in ["🟢 Status: Online", "🔴 Status: Offline"]:
+            bot_status = not bot_status
+            status_str = "🟢 Online" if bot_status else "🔴 Offline"
+            if bot_status:
+                for uid in list(offline_pending_users):
+                    try:
+                        await context.bot.send_message(chat_id=uid, text="🟢 অ্যাডমিন এখন অনলাইনে আছেন! আপনি এখন Add Money ব্যবহার করতে পারবেন।")
+                    except:
+                        pass
+                offline_pending_users.clear()
+            await update.message.reply_text(f"বট স্ট্যাটাস পরিবর্তন করা হয়েছে: {status_str}", reply_markup=admin_menu_keyboard())
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMINS:
+        return
+
+    if admin_states.get(user_id) != "admin_add_stock_file":
+        return
+
+    document = update.message.document
+    file_name = document.file_name or ""
+    if not file_name.lower().endswith(".xlsx"):
+        await update.message.reply_text("❌ একটি সঠিক **.xlsx** ফাইল আপলোড করুন।", parse_mode="Markdown")
+        return
+
+    target_data = admin_temp_data.get(user_id)
+    if not target_data:
+        await update.message.reply_text("❌ কিছু একটা সমস্যা হয়েছে। অনুগ্রহ করে 📦 Add Stock থেকে আবার শুরু করুন。", reply_markup=admin_menu_keyboard())
+        admin_states.pop(user_id, None)
+        return
+
+    cat = target_data["cat"]
+    srv = target_data["srv"]
+    short_cat = category_short_name(cat)
+
+    try:
+        file_obj = await document.get_file()
+        file_bytes = await file_obj.download_as_bytearray()
+        wb = load_workbook(filename=BytesIO(bytes(file_bytes)), data_only=True)
+        ws = wb.active
+    except Exception as e:
+        await update.message.reply_text(f"❌ এক্সেল ফাইলটি পড়তে ব্যর্থ হয়েছে: {e}")
+        return
+
+    added = 0
+    for row in ws.iter_rows(min_row=1, values_only=True):
+        if not row:
+            continue
+
+        if short_cat == "VPN":
+            email = row[0] if len(row) > 0 else None
+            password = row[1] if len(row) > 1 else None
+            email_str = format_cell_value(email)
+            if email_str == "":
+                continue
+            line = f"{email_str},{format_cell_value(password)}"
+
+        elif short_cat == "Proxy":
+            server = row[0] if len(row) > 0 else None
+            port = row[1] if len(row) > 1 else None
+            proxy_user = row[2] if len(row) > 2 else None
+            proxy_pass = row[3] if len(row) > 3 else None
+            server_str = format_cell_value(server)
+            if server_str == "":
+                continue
+            line = ",".join([
+                server_str,
+                format_cell_value(port),
+                format_cell_value(proxy_user),
+                format_cell_value(proxy_pass),
+            ])
+
+        else:
+            email = row[0] if len(row) > 0 else None
+            email_str = format_cell_value(email)
+            if email_str == "":
+                continue
+            line = email_str
+
+        products[cat]["services"][srv]["stock"].append(line)
+        added += 1
+
+    total_stock = len(products[cat]["services"][srv]["stock"])
+    await update.message.reply_text(
+        f"✅ স্টক সফলভাবে আপলোড করা হয়েছে! **{added}** টি আইটেম যোগ হয়েছে。\n**{srv}** এর মোট স্টক: {total_stock}",
+        reply_markup=admin_menu_keyboard(),
+        parse_mode="Markdown",
+    )
+
+    admin_states.pop(user_id, None)
+    admin_temp_data.pop(user_id, None)
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
+
+    if data == "verify_join":
+        joined = await check_membership(context.bot, user_id)
+        if joined:
+            registered_users.add(user_id)
+            if user_id not in user_balances:
+                user_balances[user_id] = 0.0
+            user_states[user_id] = None
+            try:
+                await query.message.edit_text("✅ জয়েন করার জন্য ধন্যবাদ! আপনি এখন বটটি ব্যবহার করতে পারবেন।")
+            except Exception as e:
+                logger.error(f"Failed to edit join-verify message for {user_id}: {e}")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="স্বাগতম! নিচে থেকে একটি অপশন বেছে নিন:",
+                reply_markup=main_menu_keyboard(user_id),
+            )
+        else:
+            await query.answer("❌ আপনি এখনো চ্যানেলে জয়েন করেননি!", show_alert=True)
+        return
+
+    if user_id not in ADMINS:
+        joined = await check_membership(context.bot, user_id)
+        if not joined:
+            await query.answer("❌ প্রথমে আমাদের চ্যানেলে জয়েন করুন!", show_alert=True)
+            try:
+                await query.message.edit_text(JOIN_PROMPT_TEXT, reply_markup=join_gate_keyboard(), parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Failed to show join gate to {user_id}: {e}")
+            return
+
+    if data == "cancel_menu":
+        await query.message.edit_text("❌ কার্যক্রম বাতিল করা হয়েছে।")
+        return
+
+    if data.startswith("add_srv_cat_"):
+        cat_key = data.replace("add_srv_cat_", "")
+        cat_map = {"VPN": "🛡️ VPN", "Proxy": "🌐 Proxy", "Trusted Mail": "📧 Trusted Mail"}
+        real_cat = cat_map.get(cat_key)
+
+        admin_temp_data[user_id] = {"category": real_cat}
+        admin_states[user_id] = "admin_add_service_name"
+        await query.message.edit_text(f"✅ নির্বাচিত ক্যাটাগরি: **{real_cat}**\n\nএখন **সার্ভিসের নাম** পাঠান:", parse_mode="Markdown")
+        return
+
+    elif data.startswith("del_srv_cat_"):
+        cat_key = data.replace("del_srv_cat_", "")
+        cat_map = {"VPN": "🛡️ VPN", "Proxy": "🌐 Proxy", "Trusted Mail": "📧 Trusted Mail"}
+        real_cat = cat_map.get(cat_key)
+
+        services = products[real_cat]["services"]
+        if not services:
+            await query.message.edit_text(f"❌ **{real_cat}** এর অধীনে ডিলিট করার মতো কোনো সার্ভিস নেই।", parse_mode="Markdown")
+            return
+
+        keyboard = []
+        for srv_name in services.keys():
+            keyboard.append([InlineKeyboardButton(srv_name, callback_data=f"confirm_del_{real_cat}_{srv_name}")])
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_menu")])
+
+        await query.message.edit_text(f"🗑️ **{real_cat}** এর অধীনে ডিলিট করার জন্য সার্ভিস বেছে নিন:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
+    elif data.startswith("confirm_del_"):
+        parts = data.replace("confirm_del_", "").split("_", 1)
+        real_cat = parts[0]
+        srv_name = parts[1]
+
+        if real_cat in products and srv_name in products[real_cat]["services"]:
+            del products[real_cat]["services"][srv_name]
+            await query.message.edit_text(f"✅ **{srv_name}** সার্ভিসটি সফলভাবে ডিলিট করা হয়েছে!", parse_mode="Markdown")
+        else:
+            await query.message.edit_text("❌ সার্ভিস খুঁজে পাওয়া যায়নি।")
+        return
+
+    elif data.startswith("price_srv_cat_"):
+        cat_key = data.replace("price_srv_cat_", "")
+        cat_map = {"VPN": "🛡️ VPN", "Proxy": "🌐 Proxy", "Trusted Mail": "📧 Trusted Mail"}
+        real_cat = cat_map.get(cat_key)
+
+        services = products[real_cat]["services"]
+        if not services:
+            await query.message.edit_text(f"❌ **{real_cat}** এর অধীনে দাম পরিবর্তন করার মতো কোনো সার্ভিস নেই।", parse_mode="Markdown")
+            return
+
+        keyboard = []
+        for srv_name in services.keys():
+            keyboard.append([InlineKeyboardButton(srv_name, callback_data=f"select_price_srv_{real_cat}_{srv_name}")])
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_menu")])
+
+        await query.message.edit_text(f"💲 **{real_cat}** এর অধীনে দাম পরিবর্তনের জন্য সার্ভিস বেছে নিন:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
+    elif data.startswith("select_price_srv_"):
+        parts = data.replace("select_price_srv_", "").split("_", 1)
+        real_cat = parts[0]
+        srv_name = parts[1]
+
+        admin_temp_data[user_id] = {"cat": real_cat, "srv": srv_name}
+        admin_states[user_id] = "admin_change_price_input"
+        await query.message.edit_text(f"💲 **{srv_name}** এর জন্য নতুন দাম পাঠান:", parse_mode="Markdown")
+        return
+
+    elif data.startswith("add_stock_cat_"):
+        cat_key = data.replace("add_stock_cat_", "")
+        cat_map = {"VPN": "🛡️ VPN", "Proxy": "🌐 Proxy", "Trusted Mail": "📧 Trusted Mail"}
+        real_cat = cat_map.get(cat_key)
+
+        services = products[real_cat]["services"]
+        if not services:
+            await query.message.edit_text(f"❌ **{real_cat}** এর অধীনে স্টক যোগ করার মতো কোনো সার্ভিস নেই।", parse_mode="Markdown")
+            return
+
+        keyboard = []
+        for srv_name in services.keys():
+            keyboard.append([InlineKeyboardButton(srv_name, callback_data=f"select_stock_srv_{real_cat}_{srv_name}")])
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_menu")])
+
+        await query.message.edit_text(f"📦 **{real_cat}** এর অধীনে স্টক যোগ করার জন্য সার্ভিস বেছে নিন:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
+    elif data.startswith("select_stock_srv_"):
+        parts = data.replace("select_stock_srv_", "").split("_", 1)
+        real_cat = parts[0]
+        srv_name = parts[1]
+
+        admin_temp_data[user_id] = {"cat": real_cat, "srv": srv_name}
+        admin_states[user_id] = "admin_add_stock_file"
+
+        short_cat = category_short_name(real_cat)
+        if short_cat == "VPN":
+            format_hint = "Column A: ইমেইল\nColumn B: পাসওয়ার্ড"
+        elif short_cat == "Proxy":
+            format_hint = "Column A: সার্ভার\nColumn B: পোর্ট\nColumn C: ইউজার\nColumn D: পাসওয়ার্ড"
+        else:
+            format_hint = "Column A: ইমেইল"
+
+        await query.message.edit_text(
+            f"📦 **{srv_name}** এর জন্য **.xlsx** স্টক ফাইল আপলোড করুন。\n\n{format_hint}\n\n(হেডার রো লাগবে না, এক রো = এক আইটেম)",
+            parse_mode="Markdown",
+        )
+        return
+
+    elif data.startswith("check_stock_cat_"):
+        cat_key = data.replace("check_stock_cat_", "")
+        cat_map = {"VPN": "🛡️ VPN", "Proxy": "🌐 Proxy", "Trusted Mail": "📧 Trusted Mail"}
+        real_cat = cat_map.get(cat_key)
+
+        services = products[real_cat]["services"]
+        if not services:
+            await query.message.edit_text(f"📊 **{real_cat}** এর অধীনে কোনো সার্ভিস পাওয়া যায়নি।", parse_mode="Markdown")
+            return
+
+        stock_report = f"📊 **{real_cat} এর স্টক রিপোর্ট:**\n\n"
+        for srv_name, srv_data in services.items():
+            stock_list = srv_data["stock"]
+            stock_report += f"🔹 **{srv_name}**\n   - দাম: {srv_data['price']} টাকা\n   - মোট স্টক: {len(stock_list)} টি আইটেম\n\n"
+
+        await query.message.edit_text(stock_report, parse_mode="Markdown")
+        return
+
+    elif data.startswith("pay_mod_"):
+        method = data.replace("pay_mod_", "")
+        admin_temp_data[user_id] = method
+        admin_states[user_id] = "admin_change_number_input"
+        await query.message.edit_text(f"📱 **{method}** এর জন্য নতুন পেমেন্ট নাম্বার পাঠান:", parse_mode="Markdown")
+        return
+
+    elif data.startswith("buy_cat_"):
+        cat_key = data.replace("buy_cat_", "")
+        cat_map = {"VPN": "🛡️ VPN", "Proxy": "🌐 Proxy", "Trusted Mail": "📧 Trusted Mail"}
+        real_cat = cat_map.get(cat_key)
+
+        services = products[real_cat]["services"]
+        if not services:
+            await query.message.edit_text(f"❌ **{real_cat}** এর অধীনে এই মুহূর্তে কোনো সার্ভিস নেই।", parse_mode="Markdown")
+            return
+
+        keyboard = []
+        short_cat = category_short_name(real_cat)
+
+        for srv_name, srv_data in services.items():
+            stock_count = len(srv_data["stock"])
+            price = srv_data["price"]
+
+            if short_cat in ["Trusted Mail", "Proxy"]:
+                btn_text = f"{srv_name}-{price}৳-stock: {stock_count}"
+            else:
+                btn_text = f"{srv_name}-{price}৳"
+
+            keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"buy_srv_{real_cat}_{srv_name}")])
+
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_menu")])
+
+        await query.message.edit_text(f"📦 **{real_cat}** এর অধীনে সার্ভিস বেছে নিন:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
+    elif data.startswith("buy_srv_"):
+        parts = data.replace("buy_srv_", "").split("_", 1)
+        real_cat = parts[0]
+        srv_name = parts[1]
+
+        srv_data = products.get(real_cat, {}).get("services", {}).get(srv_name)
+        if not srv_data:
+            await query.message.edit_text("❌ সার্ভিস খুঁজে পাওয়া যায়নি।")
+            return
+
+        stock_count = len(srv_data["stock"])
+        user_buy_data[user_id] = {"cat": real_cat, "srv": srv_name}
+        user_states[user_id] = "waiting_buy_amount"
+
+        info_text = f"💲 ইউনিট প্রাইস: {srv_data['price']} টাকা\n📦 বর্তমান স্টক: {stock_count} টি\n"
+
+        await query.message.edit_text(
+            f"🛒 **{srv_name}**\n\n{info_text}\n🔢 আপনি যে **পরিমাণ** কিনতে চান তা পাঠান:",
+            parse_mode="Markdown",
+        )
+        return
+
+    elif data.startswith("pay_"):
+        method = data.replace("pay_", "")
+        number = payment_numbers.get(method, "Not available")
+
+        user_addmoney_data[user_id] = {"method": method}
+        user_states[user_id] = "waiting_addmoney_amount"
+
+        await query.message.edit_text(
+            f"💳 **{method} পেমেন্ট**\n\nএই নাম্বারে টাকা পাঠান:\n`{number}`\n\n"
+            f"✅ টাকা পাঠানোর পর, আপনি যে **পরিমাণ** পাঠিয়েছেন তা রিপ্লাই করুন (যেমন: 100):",
+            parse_mode="Markdown"
+        )
+        return
+
+    elif data.startswith("vpn_accept_") or data.startswith("vpn_reject_"):
+        if user_id not in ADMINS:
+            return
+
+        is_accept = data.startswith("vpn_accept_")
+        try:
+            req_id = int(data.split("_")[-1])
+        except ValueError:
+            return
+
+        req = pending_vpn_orders.get(req_id)
+        if not req or req["status"] != "awaiting_admin":
+            await query.answer("❌ এই অর্ডারটি ইতিমধ্যে প্রক্রিয়া করা হয়েছে।", show_alert=True)
+            return
+
+        target_user_id = req["user_id"]
+        total_price = req["total_price"]
+        admin_name = ADMINS.get(user_id, "Admin")
+
+        if is_accept:
+            balance = user_balances.get(target_user_id, 0.0)
+            if balance < total_price:
+                await query.answer("❌ ইউজারের পর্যাপ্ত ব্যালেন্স নেই!", show_alert=True)
+                return
+
+            user_balances[target_user_id] = balance - total_price
+            req["status"] = "awaiting_delivery"
+            vpn_delivery_context[user_id] = req_id
+            admin_states[user_id] = "waiting_vpn_delivery"
+
+            original_text = query.message.text or ""
+            await query.message.edit_text(
+                f"{original_text}\n\n✅ **{admin_name} কর্তৃক রিকোয়েস্টটি গ্রহণ করা হয়েছে।**\nএখন চ্যাটে VPN একাউন্ট ইনফো (Email, Password ইত্যাদি) লিখে পাঠান, যা ইউজারের কাছে চলে যাবে।",
+                parse_mode="Markdown",
+                reply_markup=None,
+            )
+        else:
+            req["status"] = "rejected"
+            original_text = query.message.text or ""
+            await query.message.edit_text(
+                f"{original_text}\n\n❌ **{admin_name} কর্তৃক অর্ডারটি বাতিল করা হয়েছে।**",
+                parse_mode="Markdown",
+                reply_markup=None,
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=target_user_id,
+                    text=f"❌ আপনার VPN অর্ডার রিকোয়েস্ট (`#{req_id}`) অ্যাডমিন কর্তৃক বাতিল করা হয়েছে।",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify user {target_user_id} about rejected VPN order: {e}")
+        return
+
+    elif data.startswith("confirm_addmoney_") or data.startswith("cancel_addmoney_"):
+        if user_id not in ADMINS:
+            return
+
+        is_confirm = data.startswith("confirm_addmoney_")
+        try:
+            req_id = int(data.split("_")[-1])
+        except ValueError:
+            return
+
+        req = pending_addmoney_requests.get(req_id)
+        if not req or req["status"] != "pending":
+            return
+
+        target_user_id = req["user_id"]
+        amount = req["amount"]
+        admin_name = ADMINS.get(user_id, "Admin")
+
+        if is_confirm:
+            req["status"] = "confirmed"
+            user_balances[target_user_id] = user_balances.get(target_user_id, 0.0) + amount
+            result_line = f"\n\n✅ **{admin_name} কর্তৃক কনফার্ম করা হয়েছে** — ইউজারের ব্যালেন্সে {amount} টাকা যোগ করা হয়েছে।"
+            user_notify = f"✅ আপনার **{amount} টাকা** Add Money রিকোয়েস্ট কনফার্ম করা হয়েছে! আপনার ব্যালেন্স আপডেট করা হয়েছে।"
+        else:
+            req["status"] = "cancelled"
+            result_line = f"\n\n❌ **{admin_name} কর্তৃক বাতিল করা হয়েছে** — কোনো ব্যালেন্স যোগ করা হয়নি।"
+            user_notify = f"❌ আপনার **{amount} টাকা** Add Money রিকোয়েস্টটি অ্যাডমিন কর্তৃক বাতিল করা হয়েছে।"
+
+        original_text = query.message.text or ""
+        try:
+            await query.message.edit_text(f"{original_text}{result_line}", parse_mode="Markdown", reply_markup=None)
+        except Exception as e:
+            logger.error(f"Failed to edit group message: {e}")
+
+        try:
+            await context.bot.send_message(chat_id=target_user_id, text=user_notify, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Failed to notify user {target_user_id}: {e}")
+        return
+
+    elif data.startswith("support_reply_") and user_id in ADMINS:
+        target_user_id = int(data.split("_")[2])
+        already_assigned = support_assigned_admin.get(target_user_id)
+
+        if already_assigned and already_assigned != user_id:
+            other_admin_name = ADMINS.get(already_assigned, "another admin")
+            try:
+                original_text = query.message.text or ""
+                await query.message.edit_text(
+                    f"{original_text}\n\n⚠️ এই টিকিটটি ইতিমধ্যে **{other_admin_name}** হ্যান্ডেল করছেন।",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.error(f"Failed to update claimed-ticket message: {e}")
+            return
+
+        support_assigned_admin[target_user_id] = user_id
+        admin_reply_targets[user_id] = target_user_id
+        admin_states[user_id] = "waiting_admin_reply"
+
+        admin_name = ADMINS.get(user_id, "Admin")
+        for other_admin_id, msg_id in support_broadcast_msgs.get(target_user_id, []):
+            if other_admin_id == user_id:
+                continue
+            try:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=other_admin_id, message_id=msg_id, reply_markup=None
+                )
+                await context.bot.send_message(
+                    chat_id=other_admin_id,
+                    text=f"ℹ️ ইউজার `{target_user_id}` এর সাপোর্ট টিকিটটি **{admin_name}** ক্লেইম করেছেন।",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.error(f"Failed to update other admin: {e}")
+        support_broadcast_msgs.pop(target_user_id, None)
+
+        try:
+            await query.message.edit_reply_markup(reply_markup=None)
+        except Exception as e:
+            logger.error(f"Failed to clear reply markup: {e}")
+
+        await query.message.reply_text(f"👉 ইউজার `{target_user_id}` এর জন্য আপনার রিপ্লাই টাইপ করুন:", parse_mode="Markdown")
+        return
+
+    elif data == "user_support_reply":
+        assigned_admin_id = support_assigned_admin.get(user_id)
+
+        if not assigned_admin_id or assigned_admin_id not in ADMINS:
+            await query.message.reply_text(
+                "❌ এই কথোপকথনটি আর সক্রিয় নেই। অনুগ্রহ করে 🛠 Support থেকে আবার শুরু করুন。",
+                reply_markup=main_menu_keyboard(user_id),
+            )
+            return
+
+        user_states[user_id] = "waiting_support"
+
+        try:
+            await query.message.edit_reply_markup(reply_markup=None)
+        except Exception as e:
+            logger.error(f"Failed to clear reply markup: {e}")
+
+        await query.message.reply_text("✍️ আপনার রিপ্লাই টাইপ করুন:")
+        return
+
+def main():
+    # Updated Bot Token
+    TOKEN = "8247610639:AAFB9awfkJ3WoGQ2Z5ru_dxd-7iJEpigPjY"
+
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
+
+    if application.job_queue is not None:
+        application.job_queue.run_daily(
+            send_midnight_sales_report,
+            time=datetime.time(hour=0, minute=0, second=0),
+        )
+    else:
+        logger.warning(
+            "JobQueue is not available - install with `pip install \"python-telegram-bot[job-queue]\"` "
+            "to enable the automatic midnight sales report."
+        )
+
+    print("Bot is running...")
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
